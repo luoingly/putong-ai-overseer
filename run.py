@@ -4,6 +4,7 @@ import logging
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import yaml
 from dotenv import load_dotenv
@@ -101,6 +102,68 @@ def load_model_configs(config_path: str) -> dict[str, ProviderConfig]:
     return configs
 
 
+class RunContext:
+    def __init__(
+        self,
+        start_time: float,
+        recorder: Recorder,
+        model_name: str,
+        problem_id: str,
+        language_name: str,
+    ):
+        self.start_time = start_time
+        self.recorder = recorder
+        self.model_name = model_name
+        self.problem_id = problem_id
+        self.language_name = language_name
+
+    def on_turn_complete(
+        self,
+        turn_index: int,
+        conversation: list[dict[str, Any]],
+        usage: Any,
+        last_code: str | None,
+    ) -> None:
+        elapsed = time.time() - self.start_time
+        intermediate = AgentResult(
+            status=AgentStatus.Completed if last_code else AgentStatus.Failed,
+            code=last_code,
+            language=self.language_name,
+            token_usage=usage,
+            turn_count=turn_index + 1,
+            conversation=conversation,
+        )
+        self.recorder.save_intermediate(
+            model_name=self.model_name,
+            problem_id=self.problem_id,
+            language=self.language_name,
+            agent_result=intermediate,
+            elapsed_seconds=elapsed,
+            turn_index=turn_index,
+        )
+
+        token_info = f" | Tokens: {usage.total_tokens:,}" if usage and usage.total_tokens else ""
+        console.print(
+            f"\n[bold cyan]--- Turn {turn_index + 1} complete ---[/bold cyan]{token_info}"
+        )
+
+        if conversation:
+            last_msg = conversation[-1]
+            if last_msg.get("role") == "assistant":
+                content = last_msg.get("content") or ""
+                reasoning = last_msg.get("reasoning_content") or ""
+                if reasoning:
+                    preview = reasoning[:200].replace("\n", " ")
+                    console.print(f"  [dim]Reasoning: {preview}...[/dim]")
+                if content:
+                    preview = content[:200].replace("\n", " ")
+                    console.print(f"  [dim]Content: {preview}...[/dim]")
+                tool_calls = last_msg.get("tool_calls") or []
+                for tc in tool_calls:
+                    func = tc.get("function", {})
+                    console.print(f"  [yellow]Tool:[/yellow] {func.get('name', '?')}")
+
+
 async def run_one(
     model_name: str,
     problem_id: str,
@@ -122,9 +185,15 @@ async def run_one(
     console.print(f"[bold]Agent:[/bold] {agent_type}")
 
     problem = problem_registry.get(problem_id)
+    start_time = time.time()
+    ctx = RunContext(start_time, recorder, model_name, problem_id, language_name)
 
     if agent_type == "simple":
-        agent = SimpleAgent(language_name=language_name)
+        agent = SimpleAgent(
+            language_name=language_name,
+            max_turns=max_turns,
+            on_turn_complete=ctx.on_turn_complete,
+        )
     else:
         tool_executor = ToolExecutor(
             problem=problem,
@@ -135,11 +204,15 @@ async def run_one(
             language_name=language_name,
             max_turns=max_turns,
             tool_executor=tool_executor,
+            on_turn_complete=ctx.on_turn_complete,
         )
 
     start = time.time()
     agent_result: AgentResult = await agent.solve(problem, provider)
     elapsed = time.time() - start
+
+    # 清除 in_progress 标记
+    recorder.finalize(model_name=model_name, problem_id=problem_id)
 
     judge_result = None
     if agent_result.status == AgentStatus.Completed and agent_result.code:
@@ -250,7 +323,6 @@ async def async_main():
                     recorder=recorder,
                 )
 
-    recorder.save_run_summary()
     console.print(f"\n[bold]All done.[/bold] Results in: {recorder.output_dir}")
 
 

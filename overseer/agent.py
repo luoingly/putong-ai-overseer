@@ -1,5 +1,6 @@
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -10,6 +11,9 @@ from overseer.tools.definitions import ALL_TOOLS
 from overseer.tools.executor import ToolExecutor
 
 logger = logging.getLogger(__name__)
+
+# Callback type: called after each turn with (turn_index, conversation, usage, last_code)
+TurnCallback = Callable[[int, list[dict[str, Any]], Usage, str | None], None]
 
 
 class AgentStatus(StrEnum):
@@ -92,19 +96,20 @@ def _response_to_record(resp: AIResponse, model: str | None = None) -> dict[str,
             for tc in resp.tool_calls
         ]
     if resp.usage:
-        record["usage"] = {
-            "prompt_tokens": resp.usage.prompt_tokens,
-            "completion_tokens": resp.usage.completion_tokens,
-            "total_tokens": resp.usage.total_tokens,
-            "prompt_tokens_details": resp.usage.prompt_tokens_details,
-            "completion_tokens_details": resp.usage.completion_tokens_details,
-        }
+        record["usage"] = resp.usage.to_dict()
     return record
 
 
 class SimpleAgent:
-    def __init__(self, language_name: str):
+    def __init__(
+        self,
+        language_name: str,
+        max_turns: int = 5,
+        on_turn_complete: TurnCallback | None = None,
+    ):
         self.language_name = language_name
+        self.max_turns = max_turns
+        self.on_turn_complete = on_turn_complete
 
     async def solve(self, problem: Problem, provider: Any) -> AgentResult:
         statement = problem.read_statement()
@@ -119,40 +124,98 @@ class SimpleAgent:
         ]
         conversation = [_message_to_record(m) for m in messages]
 
-        try:
-            response: AIResponse = await provider.complete(messages)
-        except Exception as e:
-            logger.exception("SimpleAgent: provider call failed")
-            return AgentResult(
-                status=AgentStatus.Failed,
-                error=str(e),
-                conversation=conversation,
+        total_usage = Usage()
+        response: AIResponse | None = None
+
+        for turn in range(self.max_turns):
+            try:
+                response = await provider.complete(messages)
+            except Exception as e:
+                logger.exception("SimpleAgent: provider call failed at turn %d", turn + 1)
+                return AgentResult(
+                    status=AgentStatus.Failed,
+                    error=str(e),
+                    conversation=conversation,
+                    token_usage=total_usage,
+                    turn_count=turn + 1,
+                )
+
+            if response.usage:
+                total_usage = total_usage + response.usage
+
+            conversation.append(_response_to_record(response, provider.config.name))
+
+            assistant_msg = Message(
+                role="assistant",
+                content=response.content,
+                reasoning_content=response.reasoning_content,
+            )
+            messages.append(assistant_msg)
+
+            # 检查是否被截断
+            if response.finish_reason == "length":
+                logger.warning(
+                    "SimpleAgent: response truncated (max tokens) at turn %d, continuing...",
+                    turn + 1,
+                )
+                # 让模型继续生成
+                continue
+
+            # 尝试提取代码
+            code = _extract_code(response.content, self.language_name) or _extract_code(
+                response.content
             )
 
-        conversation.append(_response_to_record(response, provider.config.name))
+            if code is not None:
+                if self.on_turn_complete:
+                    self.on_turn_complete(turn, conversation, total_usage, code)
+                return AgentResult(
+                    status=AgentStatus.Completed,
+                    code=code,
+                    language=self.language_name,
+                    token_usage=total_usage,
+                    turn_count=turn + 1,
+                    conversation=conversation,
+                )
 
-        total_usage = response.usage or Usage()
-        code = _extract_code(response.content, self.language_name) or _extract_code(
-            response.content
-        )
+            # 如果没有找到代码块，且模型没有截断，可能是格式错误
+            if response.finish_reason != "length":
+                logger.warning("SimpleAgent: failed to extract code at turn %d", turn + 1)
+                # 让模型重新输出
+                messages.append(
+                    Message(
+                        role="user",
+                        content=f"请在 ```{self.language_name} 代码块中输出完整代码。",
+                    )
+                )
+                conversation.append(
+                    {
+                        "role": "user",
+                        "content": f"请在 ```{self.language_name} 代码块中输出完整代码。",
+                    }
+                )
 
-        if code is None:
-            logger.warning("SimpleAgent: failed to extract code from response")
-            return AgentResult(
-                status=AgentStatus.Failed,
-                token_usage=total_usage,
-                turn_count=1,
-                conversation=conversation,
-                error="Failed to extract code from model response",
+        # 达到最大轮次或最后一次响应被截断
+        final_code = None
+        if response and response.content:
+            final_code = _extract_code(response.content, self.language_name) or _extract_code(
+                response.content
             )
+
+        if response and response.finish_reason == "length":
+            logger.warning("SimpleAgent: last response truncated, may have incomplete output")
+
+        if self.on_turn_complete:
+            self.on_turn_complete(self.max_turns - 1, conversation, total_usage, final_code)
 
         return AgentResult(
-            status=AgentStatus.Completed,
-            code=code,
+            status=AgentStatus.Completed if final_code else AgentStatus.Failed,
+            code=final_code,
             language=self.language_name,
             token_usage=total_usage,
-            turn_count=1,
+            turn_count=self.max_turns,
             conversation=conversation,
+            error=None if final_code else "Failed to extract code after multiple attempts",
         )
 
 
@@ -162,10 +225,12 @@ class ToolAgent:
         language_name: str,
         max_turns: int = 10,
         tool_executor: ToolExecutor | None = None,
+        on_turn_complete: TurnCallback | None = None,
     ):
         self.language_name = language_name
         self.max_turns = max_turns
         self.tool_executor = tool_executor
+        self.on_turn_complete = on_turn_complete
 
     async def solve(
         self,
@@ -218,8 +283,21 @@ class ToolAgent:
             )
             messages.append(assistant_msg)
 
+            # 检查是否被截断（达到最大输出 Token 限制）
+            if response.finish_reason == "length":
+                logger.warning(
+                    "ToolAgent: response truncated (max tokens) at turn %d, continuing...",
+                    turn + 1,
+                )
+                # 不执行不完整的工具调用，直接继续对话让模型接着生成
+                if self.on_turn_complete:
+                    self.on_turn_complete(turn, conversation, total_usage, last_code)
+                continue
+
             if not response.tool_calls:
                 logger.debug("ToolAgent: no tool calls at turn %d, finishing", turn + 1)
+                if self.on_turn_complete:
+                    self.on_turn_complete(turn, conversation, total_usage, last_code)
                 break
 
             for tc in response.tool_calls:
@@ -250,6 +328,8 @@ class ToolAgent:
                     last_code = args["code"]
                     if "评测结果：Accepted" in result_str:
                         logger.info("ToolAgent: Accepted, stopping early")
+                        if self.on_turn_complete:
+                            self.on_turn_complete(turn, conversation, total_usage, last_code)
                         return AgentResult(
                             status=AgentStatus.Completed,
                             code=last_code,
@@ -258,6 +338,16 @@ class ToolAgent:
                             turn_count=turn + 1,
                             conversation=conversation,
                         )
+
+            # 每轮结束后调用回调（保存中间状态）
+            if self.on_turn_complete:
+                self.on_turn_complete(turn, conversation, total_usage, last_code)
+
+        # 检查最后一次响应是否被截断
+        if response and response.finish_reason == "length":
+            logger.warning(
+                "ToolAgent: last response truncated (max tokens), may have incomplete output"
+            )
 
         final_code = last_code
         if not final_code and response and response.content:

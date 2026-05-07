@@ -75,6 +75,15 @@ class Usage:
             ),
         )
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+            "prompt_tokens_details": self.prompt_tokens_details,
+            "completion_tokens_details": self.completion_tokens_details,
+        }
+
 
 @dataclass
 class AIResponse:
